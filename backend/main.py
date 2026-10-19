@@ -34,12 +34,14 @@ TOL = {"Conservative": dict(goal=15, delivery=2, risk=2, alloc=5),
 WEIGHTS = dict(goal=0.35, delivery=0.25, risk=0.20, alloc=0.20)
 MONTHS = pd.date_range("2025-11-01", periods=12, freq="MS").strftime("%b %y").tolist()
 
-# ---------------- CSV loading (adjust the keywords to your columns) ----------------
-def pick(df, *keys):
-    for c in df.columns:
-        if any(k in c.lower() for k in keys):
-            return c
-    return None
+# ---------------- CSV loading (bank-transaction log -> one row per user) ----------------
+N_CLIENTS = 220
+USD_INR = 83.0
+FIRST = ["Aarav", "Priya", "Rohan", "Ananya", "Vikram", "Sneha", "Arjun", "Kavya", "Rahul", "Meera", "Karan", "Isha",
+         "Aditya", "Pooja", "Siddharth", "Neha", "Varun", "Divya", "Nikhil", "Riya", "Manish", "Shreya", "Amit", "Tanvi"]
+LAST = ["Sharma", "Iyer", "Patel", "Reddy", "Nair", "Gupta", "Menon", "Joshi", "Rao", "Kulkarni", "Singh", "Das",
+        "Mehta", "Bose", "Pillai", "Verma", "Chopra", "Kapoor", "Shetty", "Desai"]
+SEGMENT = {"SAL": "Salaried", "GIG": "Gig worker", "REM": "Remittance", "STU": "Student"}
 
 def to_num(v):
     try:
@@ -47,26 +49,48 @@ def to_num(v):
     except Exception:
         return None
 
-def norm_risk(v):
-    s = str(v).lower()
-    if any(k in s for k in ("conserv", "low")): return "Conservative"
-    if any(k in s for k in ("aggress", "high")): return "Aggressive"
-    if any(k in s for k in ("mod", "med", "bal")): return "Moderate"
-    return None
+def fake_name(i):
+    return f"{FIRST[(i * 7) % len(FIRST)]} {LAST[(i * 11) % len(LAST)]}"
+
+def summarise_users(df):
+    """Monthly income/spend per user -> savings capacity, overspending, city."""
+    df = df.copy()
+    df["amt"] = df["amount"].map(to_num) * np.where(df["currency"].str.strip() == "USD", USD_INR, 1.0)
+    df["type"] = df["type"].str.strip().str.lower()
+    d = df["date"].str.strip()                  # rows mix dd-mm-yyyy and yyyy-mm-dd
+    df["month"] = pd.to_datetime(d, format="%d-%m-%Y", errors="coerce") \
+        .fillna(pd.to_datetime(d, format="%Y-%m-%d", errors="coerce")).dt.to_period("M")
+    df = df.dropna(subset=["amt", "month"])
+    out = []
+    for uid, g in df.groupby("user_id"):
+        m = g.pivot_table(index="month", columns="type", values="amt", aggfunc="sum", fill_value=0)
+        inc, spend = m.get("credit", pd.Series(0, m.index)), m.get("debit", pd.Series(0, m.index))
+        save = inc - spend
+        city = g["city"].dropna().mode()
+        out.append({"user_id": uid, "segment": SEGMENT.get(uid[:3], "Other"),
+                    "city": str(city.iloc[0]).strip() if len(city) else None,
+                    "income": float(inc.mean()), "savings": float(save.mean()),
+                    "save_rate": float(save.sum() / inc.sum()) if inc.sum() else 0.0})
+    return out
+
+def risk_from(u):
+    if u["segment"] == "Gig worker" or u["save_rate"] < 0.05: return "Conservative"
+    return "Aggressive" if u["save_rate"] > 0.3 else "Moderate"
 
 def load_rows():
-    df = pd.read_csv(CSV_PATH) if CSV_PATH.exists() else \
-        pd.DataFrame({"Name": [f"Investor {i:03d}" for i in range(1, 221)]})
-    name_c = pick(df, "name", "investor", "client")
-    risk_c = pick(df, "risk")
-    aum_c = pick(df, "aum", "portfolio value", "corpus", "invest", "amount", "value")
-    print(f"[csv] name={name_c} risk={risk_c} aum={aum_c} rows={len(df)}")
+    users = summarise_users(pd.read_csv(CSV_PATH)) if CSV_PATH.exists() else []
+    print(f"[csv] {len(users)} users from {CSV_PATH.name}; {N_CLIENTS - len(users)} generated")
     rows = []
-    for i, r in df.reset_index(drop=True).iterrows():
-        rows.append({"idx": i,
-                     "name": str(r[name_c]) if name_c else f"Investor {i + 1:03d}",
-                     "risk": norm_risk(r[risk_c]) if risk_c else None,
-                     "aum": to_num(r[aum_c]) if aum_c else None})
+    for i in range(N_CLIENTS):
+        row = {"idx": i, "name": fake_name(i), "risk": None, "aum": None, "sip": None, "sip_paused": None,
+               "source": "generated", "segment": None, "city": None}
+        if i < len(users):
+            u = users[i]
+            sip = max(1000.0, round(0.5 * max(u["savings"], 0), -2))
+            row.update(risk=risk_from(u), sip=sip, sip_paused=u["savings"] < 0,     # spending > income: SIP can't be funded
+                       aum=float(round(max(2e5, max(u["savings"], 0) * 12 * (3 + i % 6)), -3)),
+                       source=f"csv:{u['user_id']}", segment=u["segment"], city=u["city"])
+        rows.append(row)
     return rows
 
 # ---------------- Engine ----------------
@@ -104,11 +128,11 @@ def make_client(row):
     wt = np.array(TARGETS[risk])
     wa = np.clip(wt + rng.normal(0, 0.05, 4), 0, None); wa = wa / wa.sum()
     ra = BENCH + rng.normal(0, 1, 4) * np.array([0.025, 0.006, 0.004, 0.0])
-    sip_paused = bool(rng.random() < 0.25)
+    sip_paused = row["sip_paused"] if row["sip_paused"] is not None else bool(rng.random() < 0.25)
     beh = -abs(float(rng.normal(0.012, 0.008))) if (sip_paused or rng.random() < 0.1) else float(rng.normal(0, 0.002))
     aum = row["aum"] or float(np.round(rng.lognormal(np.log(4e6), 0.7), -3))
     years = int(rng.integers(2, 21))
-    planned_sip = float(np.round(aum * rng.uniform(0.002, 0.01), -2))
+    planned_sip = row["sip"] or float(np.round(aum * rng.uniform(0.002, 0.01), -2))
     m = float(wt @ CMA)
     proj = aum * (1 + m) ** years + planned_sip * 12 * ((1 + m) ** years - 1) / m
     return {
@@ -119,6 +143,7 @@ def make_client(row):
         "planned_sip": planned_sip, "sip": planned_sip * (0.3 if sip_paused else 1.0), "sip_paused": sip_paused,
         "breach": "Holds a restricted sector (Tobacco)" if rng.random() < 0.07 else None,
         "days_since_contact": int(rng.integers(10, 300)),
+        "source": row["source"], "segment": row["segment"], "city": row["city"],
     }
 
 CLIENTS = {c["id"]: c for c in (make_client(r) for r in load_rows())}
@@ -171,6 +196,7 @@ def triage_row(c):
         "priority": round((100 - a["ahs"]) * A * U * S + (1000 if c["breach"] else 0), 1),
         "reasons": reasons(c, a), "breach": c["breach"], "opportunity": opportunity(c, a),
         "days_since_contact": c["days_since_contact"], "tags": tags(c, a),
+        "source": c["source"], "segment": c["segment"], "city": c["city"],
     }
 
 def pct(x): return round(x * 100, 2)
