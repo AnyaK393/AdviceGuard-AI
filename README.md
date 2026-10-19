@@ -21,6 +21,23 @@ python smoke_test.py                                         # acceptance checks
 
 `backend/investors_list.csv` (bank transactions) gives 50 clients; 170 more are generated deterministically.
 
+## Run the frontend
+
+```bash
+cd frontend
+npm install
+npm run dev                                                  # http://localhost:5173
+```
+
+`frontend/.env` defaults to mock data (`VITE_MOCK=1`). To use the real backend, create `frontend/.env.local`:
+
+```
+VITE_MOCK=0
+VITE_API=http://localhost:8000
+```
+
+If an endpoint fails, the UI falls back to mock data and the console logs `API failed, using mock for …`.
+
 ## Backend phases
 
 | # | Phase | Status |
