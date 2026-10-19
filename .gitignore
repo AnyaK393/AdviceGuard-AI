@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+backend/models/*.bin
+node_modules/
+dist/
+.DS_Store
+*.m4a
+*.wav
