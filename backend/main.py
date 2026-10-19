@@ -42,6 +42,7 @@ FIRST = ["Aarav", "Priya", "Rohan", "Ananya", "Vikram", "Sneha", "Arjun", "Kavya
 LAST = ["Sharma", "Iyer", "Patel", "Reddy", "Nair", "Gupta", "Menon", "Joshi", "Rao", "Kulkarni", "Singh", "Das",
         "Mehta", "Bose", "Pillai", "Verma", "Chopra", "Kapoor", "Shetty", "Desai"]
 SEGMENT = {"SAL": "Salaried", "GIG": "Gig worker", "REM": "Remittance", "STU": "Student"}
+DEMO_OVERRIDES = {"INV0119": {"years": 19, "sip_paused": True, "sip": 18000.0}}   # capture demo: matches samples/meeting.txt
 
 def to_num(v):
     try:
@@ -49,8 +50,11 @@ def to_num(v):
     except Exception:
         return None
 
+NAMES = [f"{f} {l}" for f in FIRST for l in LAST]          # 480 unique pairs, shuffled once
+np.random.default_rng(7).shuffle(NAMES)
+
 def fake_name(i):
-    return f"{FIRST[(i * 7) % len(FIRST)]} {LAST[(i * 11) % len(LAST)]}"
+    return NAMES[i]
 
 def summarise_users(df):
     """Monthly income/spend per user -> savings capacity, overspending, city."""
@@ -90,6 +94,7 @@ def load_rows():
             row.update(risk=risk_from(u), sip=sip, sip_paused=u["savings"] < 0,     # spending > income: SIP can't be funded
                        aum=float(round(max(2e5, max(u["savings"], 0) * 12 * (3 + i % 6)), -3)),
                        source=f"csv:{u['user_id']}", segment=u["segment"], city=u["city"])
+        row.update(DEMO_OVERRIDES.get(f"INV{i + 1:04d}", {}))
         rows.append(row)
     return rows
 
@@ -132,6 +137,7 @@ def make_client(row):
     beh = -abs(float(rng.normal(0.012, 0.008))) if (sip_paused or rng.random() < 0.1) else float(rng.normal(0, 0.002))
     aum = row["aum"] or float(np.round(rng.lognormal(np.log(4e6), 0.7), -3))
     years = int(rng.integers(2, 21))
+    years = row.get("years") or years
     planned_sip = row["sip"] or float(np.round(aum * rng.uniform(0.002, 0.01), -2))
     m = float(wt @ CMA)
     proj = aum * (1 + m) ** years + planned_sip * 12 * ((1 + m) ** years - 1) / m
@@ -217,7 +223,7 @@ def detail(c):
     row = triage_row(c)
     headline = (f"{row['status']}: {gap * 100:+.1f}% vs what the advice expected. "
                 f"Market explains {a['market'] * 100:+.1f}%; {ctrl * 100:+.1f}% is controllable "
-                f"({row['reasons'][0].lower()}).")
+                f"({row['reasons'][1 if c['breach'] and len(row['reasons']) > 1 else 0].lower()}).")
     return {**row,
         "headline": headline,
         "goal_amount": c["goal_amount"],
@@ -333,6 +339,21 @@ def regex_extract(text):
         out["restricted_sectors"] = [x.strip().title() for x in re.split(r",|\band\b", m.group(1)) if x.strip()]
     return out
 
+def fill_evidence(data, text):
+    """Small models drop or mislabel evidence; quote the sentence that contains each value."""
+    sents = [x.strip() for x in re.split(r"(?<=[.!?])\s+", text) if x.strip()]
+    ev = [e for e in data.get("evidence") or [] if isinstance(e, dict) and e.get("field") in data and e.get("quote")]
+    have = {e["field"] for e in ev}
+    for k, v in data.items():
+        if k in ("evidence", "advice_items", "life_events") or k in have or v in (None, "", []): continue
+        if isinstance(v, list): needles = [str(x).lower() for x in v]
+        elif isinstance(v, (int, float)): needles = [f"{v:,.0f}", f"{v:g}"]
+        else: needles = [str(v).lower()[:6]]
+        hit = next((x for x in sents if any(n in x.lower() for n in needles)), None)
+        if hit: ev.append({"field": k, "quote": hit})
+    data["evidence"] = ev
+    return data
+
 class ExtractIn(BaseModel):
     investor_id: str
     text: str
@@ -349,10 +370,10 @@ def extract(body: ExtractIn):
             if isinstance(data, dict) and data:
                 for k, v in regex_extract(body.text).items():   # small model skips fields; rules fill the gaps
                     data.setdefault(k, v)
-                return {"extracted": data, "current": current, "source": "local LLM"}
+                return {"extracted": fill_evidence(data, body.text), "current": current, "source": "local LLM"}
         except Exception as e:
             print("[extract] retry:", e)
-    return {"extracted": regex_extract(body.text), "current": current, "source": "regex fallback"}
+    return {"extracted": fill_evidence(regex_extract(body.text), body.text), "current": current, "source": "regex fallback"}
 
 class ApproveIn(BaseModel):
     extracted: dict
@@ -375,41 +396,48 @@ def approve(iid: str, body: ApproveIn):
 # ---- Local LLM: grounded client brief ----
 BRIEF_PROMPT = """Write a short note (under 120 words) from a financial advisor to their client.
 Start with "Dear {{CLIENT}},". Tone: {tone}. Plain language, no jargon.
-Explain what happened, why, and what is proposed.
-Use ONLY numbers that appear in FACTS, written exactly as given. Do not compute new numbers.
+Explain what happened, why, and what is proposed. Do not copy the FACTS labels; say it naturally.
+Use ONLY numbers that appear in FACTS, written exactly as given, including any minus sign. Do not compute new numbers.
+Sign off as "Your advisor".
 
 FACTS:
 {facts}"""
 
+NUM = r"-?\d+(?:\.\d+)?"          # sign included: "-7.3" must not pass for a fact of "7.3"
+
 def numbers_ok(text, facts):
-    allowed = json.dumps(facts)
-    return all(n in allowed for n in re.findall(r"\d+(?:\.\d+)?", text))
+    allowed = set(re.findall(NUM, json.dumps(facts)))
+    return all(n in allowed for n in re.findall(NUM, text))
 
 @app.post("/api/brief/{iid}")
 def brief(iid: str):
     c = get(iid); a = c["a"]; rb = rebalance(iid)
-    facts = {  # the LLM sees an ID, never the name
-        "investor_id": c["id"], "goal": c["goal"], "goal_year": str(c["goal_year"]),
-        "expected_return_pct": f"{a['exp'] * 100:.1f}", "actual_return_pct": f"{a['xirr'] * 100:.1f}",
-        "market_effect_pct": f"{a['market'] * 100:.1f}",
-        "goal_probability_now_pct": str(round(a["gp"])), "goal_probability_after_pct": str(rb["after"]["goal_prob"]),
-        "proposed_actions": [f"{t['action']}{'' if t['asset'] in t['action'] else ' ' + t['asset']}: {t['detail']}"
+    facts = {  # the LLM never sees the name or ID
+        "Goal": f"{c['goal']} by {c['goal_year']}",
+        "Return we planned for last year": f"{a['exp'] * 100:.1f}%",
+        "Return the client actually got": f"{a['xirr'] * 100:.1f}%",
+        "Part caused by the overall market": f"{a['market'] * 100:.1f}%",
+        "Chance of reaching the goal today": f"{round(a['gp'])}%",
+        "Chance after the proposed changes": f"{rb['after']['goal_prob']}%",
+        "Proposed changes": [f"{t['action']}{'' if t['asset'] in t['action'] else ' ' + t['asset']}: {t['detail']}"
                              for t in rb["trades"]],
-        "style": rb["style"],
+        "How we will do it": rb["style"],
     }
     tone = "calm and reassuring" if "Redeems in drawdowns" in tags(c, a) else "clear and direct"
-    for _ in range(2):
+    for _ in range(3):
         try:
             text = ollama_chat(BRIEF_PROMPT.format(tone=tone, facts=json.dumps(facts, indent=1)), temperature=0.3)
-            text = text.replace(c["id"], "{CLIENT}")
+            text = re.sub(r"^\s*Dear\s+[{\[]?CLIENT[}\]]?", "Dear {CLIENT}", text)   # model sometimes drops the braces
             if numbers_ok(text, facts):
                 return {"text": text.strip(), "verified": True, "source": "local LLM"}
+            print("[brief] rejected numbers:", set(re.findall(NUM, text)) - set(re.findall(NUM, json.dumps(facts))))
         except Exception as e:
             print("[brief] retry:", e)
-    text = (f"Dear {{CLIENT}},\n\nOver the last year your portfolio returned {facts['actual_return_pct']}% against the "
-            f"{facts['expected_return_pct']}% we planned for; the market accounted for {facts['market_effect_pct']}%. "
-            f"To keep your {c['goal'].lower()} goal for {facts['goal_year']} on track, we propose: "
-            + "; ".join(facts["proposed_actions"]) + ". I'd like to walk you through this on a short call.")
+    text = (f"Dear {{CLIENT}},\n\nOver the last year your portfolio returned {facts['Return the client actually got']} "
+            f"against the {facts['Return we planned for last year']} we planned for; the market accounted for "
+            f"{facts['Part caused by the overall market']}. To keep your {c['goal'].lower()} goal for {c['goal_year']} on track, "
+            "we propose: " + "; ".join(facts["Proposed changes"]) + ". I'd like to walk you through this on a short call."
+            "\n\nYour advisor")
     return {"text": text, "verified": True, "source": "template"}
 
 # ---- Local speech to text ----

@@ -8,7 +8,16 @@ frontend/   React UI (Person B)
 docs/       notes, demo client IDs
 ```
 
-## Run the backend
+## Run the demo
+
+```bash
+./start_demo.sh      # backend :8000 + frontend :5173, opens the browser
+```
+
+Demo clients: [docs/demo_clients.md](docs/demo_clients.md) · Recording: [docs/video_script.md](docs/video_script.md).
+The frontend reads `frontend/.env.local` (`VITE_MOCK=0`, created by the script); without it, it uses mock data.
+
+## First-time backend setup
 
 ```bash
 cd backend
@@ -43,9 +52,9 @@ If an endpoint fails, the UI falls back to mock data and the console logs `API f
 | # | Phase | Status |
 |---|---|---|
 | 1 | Scaffold: repo, venv, engine, triage/detail/rebalance APIs | done |
-| 2 | Local AI: `/api/extract`, `/api/brief` on llama3.2:3b | done (extract ~8s, brief ~18s, 5/5 verified) |
-| 3 | Audio: whisper-cpp + ffmpeg, `/api/transcribe` | done (~25s per clip) |
+| 2 | Local AI: `/api/extract`, `/api/brief` on llama3.2:3b | done (extract ~9s, brief ~20s, numbers verified incl. sign) |
+| 3 | Audio: whisper-cpp + ffmpeg, `/api/transcribe` | done (~10s per clip) |
 | 4 | CSV (50 real users + 170 generated) + 3 demo clients | done, see [docs/demo_clients.md](docs/demo_clients.md) |
-| 5 | Run B's frontend on the Mac, offline run-through, record video | todo |
+| 5 | B's frontend on the Mac, full UI run-through, start script, recording script | done; Wi-Fi-off pass + recording are manual |
 
 API contract and engine details: [PERSON_A_MAC_BACKEND.md](PERSON_A_MAC_BACKEND.md).
